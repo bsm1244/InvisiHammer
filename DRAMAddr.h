@@ -21,7 +21,7 @@
 #define NUM_BANKS 16
 #define DIMM 1
 #define CHANNEL 1
-#define THRESH 300
+#define THRESH 320
 
 uint64_t static inline MB(uint64_t value) {
   return ((value) << 20ULL);
